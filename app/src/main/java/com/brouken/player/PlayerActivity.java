@@ -174,6 +174,8 @@ public class PlayerActivity extends Activity {
     public BrightnessControl mBrightnessControl;
     public static boolean haveMedia;
     private boolean videoLoading;
+    // Catch-up HLS source recovery attempts for the current item.
+    private long catchupRecoveryAttempts = 0;
     public static boolean controllerVisible;
     public static boolean controllerVisibleFully;
     public static Snackbar snackbar;
@@ -1470,6 +1472,8 @@ public class PlayerActivity extends Activity {
 
     @Override
     public void finish() {
+        // Only a deliberate exit creates a one-time resume point for VOD/catch-up.
+        markResumeAfterExit();
         if (intentReturnResult) {
             Intent intent = new Intent("com.mxtech.intent.result.VIEW");
             intent.putExtra(API_END_BY, playbackFinished ? "playback_completion" : "user");
@@ -1595,7 +1599,7 @@ public class PlayerActivity extends Activity {
                     if (seekTo < 0)
                         seekTo = 0;
                     hideOverlayCardForNow();
-                    seekToKeyframes(SeekParameters.PREVIOUS_SYNC);
+                    seekToKeyframes(SeekParameters.EXACT);
                     player.seekTo(seekTo);
                     final String message = Utils.formatMilisSign(seekTo - playerView.keySeekStart) + "\n" + Utils.formatMilis(seekTo);
                     playerView.setCustomErrorMessage(message);
@@ -1620,7 +1624,7 @@ public class PlayerActivity extends Activity {
                     if (seekMax != C.TIME_UNSET && seekTo > seekMax)
                         seekTo = seekMax;
                     hideOverlayCardForNow();
-                    seekToKeyframes(SeekParameters.NEXT_SYNC);
+                    seekToKeyframes(SeekParameters.EXACT);
                     player.seekTo(seekTo);
                     final String message = Utils.formatMilisSign(seekTo - playerView.keySeekStart) + "\n" + Utils.formatMilis(seekTo);
                     playerView.setCustomErrorMessage(message);
@@ -2489,6 +2493,7 @@ public class PlayerActivity extends Activity {
     }
 
     public void initializePlayer() {
+        catchupRecoveryAttempts = 0;
         boolean isNetworkUri = Utils.isSupportedNetworkUri(mPrefs.mediaUri);
         haveMedia = mPrefs.mediaUri != null;
         if (haveMedia) {
@@ -2575,6 +2580,7 @@ public class PlayerActivity extends Activity {
         // debrid links often redirect between http and https, which Media3 refuses by default
         final DefaultHttpDataSource.Factory httpFactory = new DefaultHttpDataSource.Factory()
                 .setAllowCrossProtocolRedirects(true);
+        DefaultHttpDataSource.Factory hlsHttpFactory = httpFactory;
         DefaultMediaSourceFactory mediaSourceFactory =
                 new DefaultMediaSourceFactory(
                         new androidx.media3.datasource.DefaultDataSource.Factory(this, httpFactory),
@@ -2609,6 +2615,7 @@ public class PlayerActivity extends Activity {
                         }
                     }
                     defaultHttpDataSourceFactory.setDefaultRequestProperties(headers);
+                    hlsHttpFactory = defaultHttpDataSourceFactory;
                     // wrapped, so a subtitle file on the device still opens beside the stream
                     DefaultMediaSourceFactory networkMediaSourceFactory =
                             new DefaultMediaSourceFactory(new androidx.media3.datasource.DefaultDataSource.Factory(
@@ -2617,6 +2624,15 @@ public class PlayerActivity extends Activity {
                     playerBuilder.setMediaSourceFactory(networkMediaSourceFactory);
                 }
             }
+        }
+        // Catch-up/Stalker HLS needs the same playlist growth and 404 recovery
+        // used by the tested Just Player 0.189 build. Keep all other source types
+        // on the existing MediaSourceFactory and leave web playback untouched.
+        if (web == null && haveMedia && isNetworkUri && shouldUseCatchupHlsRecovery()) {
+            GrowingHlsDataSource.Factory growingHlsFactory = new GrowingHlsDataSource.Factory(
+                    new androidx.media3.datasource.DefaultDataSource.Factory(this, hlsHttpFactory),
+                    isLikelyCatchupUrl(), isLikelyStalkerHlsUrl());
+            playerBuilder.setMediaSourceFactory(CatchupHlsRecovery.createFactory(growingHlsFactory, true));
         }
         if (web != null) {
             playerBuilder.setMediaSourceFactory(web.sources(this, extractorsFactory, subtitleParserFactory));
@@ -2838,7 +2854,8 @@ public class PlayerActivity extends Activity {
 
             updateLoading(true);
 
-            if (mPrefs.getPosition() == 0L || apiAccess || apiAccessPartial || playOnLoad) {
+            // Network VOD/catch-up should autoplay even when resuming a saved position.
+            if (managesVodResume() || mPrefs.getPosition() == 0L || apiAccess || apiAccessPartial || playOnLoad) {
                 play = true;
             }
             playOnLoad = false;
@@ -3064,6 +3081,84 @@ public class PlayerActivity extends Activity {
                 sidecarSubtitleUris.add(subtitle.uri.toString());
             }
         }
+    }
+
+    private boolean isLikelyCatchupUrl() {
+        if (mPrefs == null || mPrefs.mediaUri == null
+                || !Utils.isSupportedNetworkUri(mPrefs.mediaUri)) return false;
+        Uri uri = mPrefs.mediaUri;
+        String url = uri.toString().toLowerCase(java.util.Locale.ROOT);
+        String path = uri.getPath() == null ? "" : uri.getPath().toLowerCase(java.util.Locale.ROOT);
+        if (url.contains("timeshift") || url.contains("catchup")
+                || url.contains("catch-up") || url.contains("archive")
+                || url.contains("playback") || path.contains("/timeshift/")
+                || path.contains("/archive/")) return true;
+        String[] keys = {"start", "utc", "lutc", "duration", "archive", "timeshift", "catchup", "shift"};
+        for (String key : keys) {
+            if (uri.getQueryParameter(key) != null) return true;
+        }
+        String command = uri.getQueryParameter("cmd");
+        if (command != null) {
+            String value = command.toLowerCase(java.util.Locale.ROOT);
+            if (value.contains("timeshift") || value.contains("archive")
+                    || value.contains("catchup") || value.contains("utc=")
+                    || value.contains("lutc=") || value.contains("start=")
+                    || value.contains("duration=")) return true;
+        }
+        String lastSegment = path.substring(path.lastIndexOf('/') + 1);
+        return lastSegment.matches(".*index[-_][0-9]{8,}[-_][0-9]+\\.m3u8");
+    }
+
+    private boolean isLikelyStalkerHlsUrl() {
+        if (mPrefs == null || mPrefs.mediaUri == null
+                || !Utils.isSupportedNetworkUri(mPrefs.mediaUri)) return false;
+        Uri uri = mPrefs.mediaUri;
+        String url = uri.toString().toLowerCase(java.util.Locale.ROOT);
+        String path = uri.getPath() == null ? "" : uri.getPath().toLowerCase(java.util.Locale.ROOT);
+        return path.contains("stalker_portal")
+                || path.endsWith("/play/live.php")
+                || path.endsWith("/play/timeshift.php")
+                || path.endsWith("/timeshift.php")
+                || "m3u8".equalsIgnoreCase(uri.getQueryParameter("extension"))
+                || uri.getQueryParameter("mac") != null
+                || uri.getQueryParameter("stb") != null
+                || (uri.getQueryParameter("type") != null && uri.getQueryParameter("action") != null)
+                || url.contains("real_id=");
+    }
+
+    private boolean shouldUseCatchupHlsRecovery() {
+        if (mPrefs == null || mPrefs.mediaUri == null) return false;
+        String path = mPrefs.mediaUri.getPath();
+        boolean hls = androidx.media3.common.MimeTypes.APPLICATION_M3U8.equals(mPrefs.mediaType)
+                || (path != null && path.toLowerCase(java.util.Locale.ROOT).endsWith(".m3u8"))
+                || isLikelyStalkerHlsUrl();
+        return hls && (isLikelyCatchupUrl() || isLikelyStalkerHlsUrl());
+    }
+
+    private boolean recoverCatchupPlayback() {
+        if (!(player instanceof ExoPlayer) || mPrefs == null || mPrefs.mediaUri == null
+                || playerView == null || isFinishing() || isDestroyed()) return false;
+        final long resumePositionMs = Math.max(0L, player.getCurrentPosition());
+        final boolean shouldResume = player.getPlayWhenReady();
+        final MediaItem retryItem = player.getCurrentMediaItem() != null
+                ? player.getCurrentMediaItem() : MediaItem.fromUri(mPrefs.mediaUri);
+        catchupRecoveryAttempts++;
+        final long delayMs = Math.min(250L << Math.min(catchupRecoveryAttempts - 1, 4), 3000L);
+        updateLoading(true);
+        playerView.postDelayed(() -> {
+            if (!(player instanceof ExoPlayer) || playerView == null || isFinishing() || isDestroyed()) return;
+            try {
+                player.setMediaItem(retryItem, resumePositionMs);
+                player.prepare();
+                player.setPlayWhenReady(shouldResume);
+            } catch (RuntimeException error) {
+                android.util.Log.w(Utils.TAG, "Catch-up HLS recovery failed", error);
+                recoverFromSourceError(ExoPlaybackException.createForSource(
+                        new java.io.IOException("Catch-up HLS recovery failed", error),
+                        PlaybackException.ERROR_CODE_IO_UNSPECIFIED));
+            }
+        }, delayMs);
+        return true;
     }
 
     private class PlayerListener implements Player.Listener {
@@ -3412,6 +3507,11 @@ public class PlayerActivity extends Activity {
         }
         @Override
         public void onPlayerError(PlaybackException error) {
+            if (error instanceof ExoPlaybackException
+                    && ((ExoPlaybackException) error).type == ExoPlaybackException.TYPE_SOURCE
+                    && shouldUseCatchupHlsRecovery() && recoverCatchupPlayback()) {
+                return;
+            }
             // a reopen that fails while the host is still down: try again, later
             if (reconnectAttempt >= 0) {
                 if (reconnectBrokenStream(error.getErrorCodeName())) {
@@ -4203,6 +4303,48 @@ public class PlayerActivity extends Activity {
     }
 
     // also used by onNewIntent, so it must forget everything about the previous film
+    // Network VOD and catch-up links start from zero on a fresh entry.
+    // A position is resumed only after the user explicitly leaves the player.
+    private static final String PREF_RESUME_AFTER_EXIT = "resumeAfterExit:";
+
+    private String resumeAfterExitKey(@Nullable final Uri uri) {
+        return uri == null ? null : PREF_RESUME_AFTER_EXIT + uri.toString();
+    }
+
+    private boolean managesVodResume() {
+        return mPrefs != null && mPrefs.mediaUri != null
+                && Utils.isSupportedNetworkUri(mPrefs.mediaUri)
+                && (isLikelyCatchupUrl() || !BufferProfile.looksLive(mPrefs.mediaUri));
+    }
+
+    private boolean consumeResumeAfterExit(@Nullable final Uri uri) {
+        final String key = resumeAfterExitKey(uri);
+        if (key == null) {
+            return false;
+        }
+        final android.content.SharedPreferences preferences = mPrefs.mSharedPreferences;
+        if (!preferences.getBoolean(key, false)) {
+            return false;
+        }
+        preferences.edit().remove(key).apply();
+        return true;
+    }
+
+    private void markResumeAfterExit() {
+        if (!managesVodResume() || player == null || !ownsPlayer()
+                || !player.isCurrentMediaItemSeekable()
+                || (playingLive() && !isLikelyCatchupUrl())) {
+            return;
+        }
+        final long position = player.getCurrentPosition();
+        final long duration = player.getDuration() == C.TIME_UNSET ? 0L : player.getDuration();
+        mPrefs.updatePosition(position, duration);
+        final String key = resumeAfterExitKey(mPrefs.mediaUri);
+        if (key != null) {
+            mPrefs.mSharedPreferences.edit().putBoolean(key, true).apply();
+        }
+    }
+
     private void openFromLaunch(final Intent intent) {
         playOnLoad = true;
 
@@ -4232,6 +4374,9 @@ public class PlayerActivity extends Activity {
             mPrefs.updateMedia(this, uri, intent.getType());
             mPrefs.setMediaTitle(apiTitle);
             if (intent.getBooleanExtra(EXTRA_FROM_START, false)) {
+                mPrefs.updatePosition(0L);
+            } else if (managesVodResume() && !consumeResumeAfterExit(uri)) {
+                // Ignore any old history position on a fresh VOD/catch-up entry.
                 mPrefs.updatePosition(0L);
             }
             // after updateMedia, which creates the history entry this renames
