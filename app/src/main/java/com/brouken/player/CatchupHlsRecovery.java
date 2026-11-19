@@ -62,12 +62,14 @@ final class CatchupHlsRecovery {
         HlsMediaSource.Factory factory = new HlsMediaSource.Factory(hlsDataSourceFactory);
         if (enable404Recovery) {
             factory.setPlaylistTrackerFactory(
-                    (dataSourceFactory, loadErrorHandlingPolicy, playlistParserFactory, cmcdConfiguration) -> {
+                    (dataSourceFactory, loadErrorHandlingPolicy, playlistParserFactory, cmcdConfiguration,
+                     downloadExecutorSupplier) -> {
                         HlsPlaylistTracker tracker = DefaultHlsPlaylistTracker.FACTORY.createTracker(
                                 dataSourceFactory,
                                 loadErrorHandlingPolicy,
                                 playlistParserFactory,
-                                cmcdConfiguration);
+                                cmcdConfiguration,
+                                downloadExecutorSupplier);
                         controller.setTracker(tracker);
                         return tracker;
                     });
