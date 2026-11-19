@@ -1472,6 +1472,8 @@ public class PlayerActivity extends Activity {
 
     @Override
     public void finish() {
+        // Only a deliberate exit creates a one-time resume point for VOD/catch-up.
+        markResumeAfterExit();
         if (intentReturnResult) {
             Intent intent = new Intent("com.mxtech.intent.result.VIEW");
             intent.putExtra(API_END_BY, playbackFinished ? "playback_completion" : "user");
@@ -4300,6 +4302,48 @@ public class PlayerActivity extends Activity {
     }
 
     // also used by onNewIntent, so it must forget everything about the previous film
+    // Network VOD and catch-up links start from zero on a fresh entry.
+    // A position is resumed only after the user explicitly leaves the player.
+    private static final String PREF_RESUME_AFTER_EXIT = "resumeAfterExit:";
+
+    private String resumeAfterExitKey(@Nullable final Uri uri) {
+        return uri == null ? null : PREF_RESUME_AFTER_EXIT + uri.toString();
+    }
+
+    private boolean managesVodResume() {
+        return mPrefs != null && mPrefs.mediaUri != null
+                && Utils.isSupportedNetworkUri(mPrefs.mediaUri)
+                && (isLikelyCatchupUrl() || !BufferProfile.looksLive(mPrefs.mediaUri));
+    }
+
+    private boolean consumeResumeAfterExit(@Nullable final Uri uri) {
+        final String key = resumeAfterExitKey(uri);
+        if (key == null) {
+            return false;
+        }
+        final android.content.SharedPreferences preferences = mPrefs.mSharedPreferences;
+        if (!preferences.getBoolean(key, false)) {
+            return false;
+        }
+        preferences.edit().remove(key).apply();
+        return true;
+    }
+
+    private void markResumeAfterExit() {
+        if (!managesVodResume() || player == null || !ownsPlayer()
+                || !player.isCurrentMediaItemSeekable()
+                || (playingLive() && !isLikelyCatchupUrl())) {
+            return;
+        }
+        final long position = player.getCurrentPosition();
+        final long duration = player.getDuration() == C.TIME_UNSET ? 0L : player.getDuration();
+        mPrefs.updatePosition(position, duration);
+        final String key = resumeAfterExitKey(mPrefs.mediaUri);
+        if (key != null) {
+            mPrefs.mSharedPreferences.edit().putBoolean(key, true).apply();
+        }
+    }
+
     private void openFromLaunch(final Intent intent) {
         playOnLoad = true;
 
@@ -4329,6 +4373,9 @@ public class PlayerActivity extends Activity {
             mPrefs.updateMedia(this, uri, intent.getType());
             mPrefs.setMediaTitle(apiTitle);
             if (intent.getBooleanExtra(EXTRA_FROM_START, false)) {
+                mPrefs.updatePosition(0L);
+            } else if (managesVodResume() && !consumeResumeAfterExit(uri)) {
+                // Ignore any old history position on a fresh VOD/catch-up entry.
                 mPrefs.updatePosition(0L);
             }
             // after updateMedia, which creates the history entry this renames
