@@ -2854,7 +2854,8 @@ public class PlayerActivity extends Activity {
 
             updateLoading(true);
 
-            if (mPrefs.getPosition() == 0L || apiAccess || apiAccessPartial || playOnLoad) {
+            // Network VOD/catch-up should autoplay even when resuming a saved position.
+            if (managesVodResume() || mPrefs.getPosition() == 0L || apiAccess || apiAccessPartial || playOnLoad) {
                 play = true;
             }
             playOnLoad = false;
